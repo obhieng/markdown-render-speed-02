@@ -138,20 +138,33 @@ function isAlnumAscii(ch) {
   return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
 }
 
+// Sticky (lastIndex-anchored) helpers for the text-run scanner: an email
+// local part followed by '@', and a hard-break run of spaces + newline.
+const RE_EMAIL_AT = /[a-zA-Z0-9.!#$%&'*+\/=?_`{|}~-]+@/y;
+const RE_HARD_BREAK = / {2,}\n/y;
+
 // Does src starting at j begin with an email local part followed by '@'?
+// (Sticky regex, no allocation.)
 function emailStartsAt(src, j) {
-  let k = j;
-  while (k < src.length && isEmailLocal(src[k])) k++;
-  return k > j && k < src.length && src[k] === '@';
+  RE_EMAIL_AT.lastIndex = j;
+  return RE_EMAIL_AT.test(src);
 }
 // Does src starting at j begin with mailto: or xmpp: ?
 function emailProtoAt(src, j) {
   return src.startsWith('mailto:', j) || src.startsWith('xmpp:', j);
 }
 // Does src starting at j begin with http:// https:// ftp:// (any case)?
+// Direct char-code comparison, no allocation.
 function urlProtoAt(src, j) {
-  const s = src.slice(j, j + 8).toLowerCase();
-  return s.startsWith('http://') || s.startsWith('https://') || s.startsWith('ftp://');
+  const a = src.charCodeAt(j) | 32, b = src.charCodeAt(j + 1) | 32,
+    c = src.charCodeAt(j + 2) | 32, d = src.charCodeAt(j + 3) | 32;
+  if (a === 104 && b === 116 && c === 116 && d === 112) { // http
+    if (src.charCodeAt(j + 4) === 58 && src.charCodeAt(j + 5) === 47 && src.charCodeAt(j + 6) === 47) return true; // ://
+    if ((src.charCodeAt(j + 4) | 32) === 115 && src.charCodeAt(j + 5) === 58 && src.charCodeAt(j + 6) === 47 && src.charCodeAt(j + 7) === 47) return true; // s://
+    return false;
+  }
+  if (a === 102 && b === 116 && c === 112 && src.charCodeAt(j + 3) === 58 && src.charCodeAt(j + 4) === 47 && src.charCodeAt(j + 5) === 47) return true; // ftp://
+  return false;
 }
 // Does src starting at j begin with www. preceded (in the text run) by start,
 // whitespace, *, _, ~ or ( ?
@@ -517,7 +530,7 @@ function textEnd(src, i) {
   // Immediate stops right after the first character.
   if (j >= n) return j;
   if (src[j] === '`' || src[j] === '~') return j;
-  if (src[j] === ' ' && /^ {2,}\n/.test(src.slice(j))) return j;
+  if (src[j] === ' ') { RE_HARD_BREAK.lastIndex = j; if (RE_HARD_BREAK.test(src)) return j; }
   if (emailStartsAt(src, j)) return j;
   while (j < n) {
     const c = src[j];
@@ -526,7 +539,10 @@ function textEnd(src, i) {
     if (c === 'w' && wwwStartsAt(src, j, src[j - 1] ?? '')) return j;
     // A non-space character followed by two or more spaces and a newline is
     // kept in the text; the run ends right after it (hard break follows).
-    if (c !== ' ' && src[j + 1] === ' ' && /^ {2,}\n/.test(src.slice(j + 1))) return j + 1;
+    if (c !== ' ' && src[j + 1] === ' ') {
+      RE_HARD_BREAK.lastIndex = j + 1;
+      if (RE_HARD_BREAK.test(src)) return j + 1;
+    }
     // A non-alphanumeric character followed by mailto:/xmpp: is kept, then stop.
     if (!isAlnumAscii(c) && emailProtoAt(src, j + 1)) return j + 1;
     // A character outside the email local set, followed by local@, is kept.
@@ -538,7 +554,14 @@ function textEnd(src, i) {
 
 // ============================== inline: main loop ==============================
 
+// Any character/pattern that can start an inline token. If an inline source
+// contains none of these, it is a single plain text run. (Protocol matching
+// is case-insensitive, like RE_URL; www./mailto:/xmpp: are lowercase-only.)
+const RE_INLINE_TRIGGER = /[\\<!\[`*~_]|[hH][tT][tT][pP][sS]?:\/\/|[fF][tT][pP]:\/\/|www\.|mailto:|xmpp:|[a-zA-Z0-9._+-]+@| {2,}\n/;
+
 function inlineParse(src, links, st, plain) {
+  // Fast path: plain prose with no inline markup at all.
+  if (!RE_INLINE_TRIGGER.test(src)) return renderText(src, st.inRawBlock, plain);
   const linkParenPossible = src.includes(')');
   let masked = null, closer = null;
   if (src.includes('*') || src.includes('_') || src.includes('~')) {
@@ -554,17 +577,17 @@ function inlineParse(src, links, st, plain) {
     if (!prevWasText) prevChar = '';
     prevWasText = false;
     const ch = src[i];
-    const rest = src.slice(i);
+    let rest = null; // sliced remainder, computed lazily (text runs never need it)
     let done = false;
 
     // Backslash escape.
     if (ch === '\\') {
-      const m = RE_ESCAPE.exec(rest);
+      const m = RE_ESCAPE.exec((rest ?? (rest = src.slice(i))));
       if (m) { out += plain ? m[1] : esc(m[1], false); i += 2; done = true; }
     }
     // Raw HTML tag / comment / processing instruction.
     if (!done && ch === '<') {
-      const m = RE_TAG.exec(rest);
+      const m = RE_TAG.exec((rest ?? (rest = src.slice(i))));
       if (m) {
         const tag = m[0];
         if (!st.inLink && RE_START_A.test(tag)) st.inLink = true;
@@ -577,11 +600,11 @@ function inlineParse(src, links, st, plain) {
     }
     // Inline link / image: [text](href "title").
     if (!done && (ch === '[' || ch === '!') && linkParenPossible) {
-      const m = RE_LINK.exec(rest);
+      const m = RE_LINK.exec((rest ?? (rest = src.slice(i))));
       if (m) {
         const isImage = m[0][0] === '!';
         const off = isImage ? 2 : 1;
-        let ok = !linkTextHasTag(rest, m[1], off);
+        let ok = !linkTextHasTag((rest ?? (rest = src.slice(i))), m[1], off);
         let href = '', title = '';
         if (ok) {
           const s = m[2].trim();
@@ -620,11 +643,11 @@ function inlineParse(src, links, st, plain) {
     }
     // Reference / shortcut link: [text][ref], [text][], [ref].
     if (!done && (ch === '[' || ch === '!')) {
-      const m = RE_REFLINK.exec(rest) || RE_NOLINK.exec(rest);
+      const m = RE_REFLINK.exec((rest ?? (rest = src.slice(i)))) || RE_NOLINK.exec((rest ?? (rest = src.slice(i))));
       if (m) {
         const isImage = m[0][0] === '!';
         const off = isImage ? 2 : 1;
-        if (!linkTextHasTag(rest, m[1], off)) {
+        if (!linkTextHasTag((rest ?? (rest = src.slice(i))), m[1], off)) {
           const def = links[normLabel(m[2] || m[1])];
           if (!def) {
             // No such reference: the [ or ! is literal text.
@@ -647,7 +670,7 @@ function inlineParse(src, links, st, plain) {
     }
     // Code span.
     if (!done && ch === '`') {
-      const m = RE_CODESPAN.exec(rest);
+      const m = RE_CODESPAN.exec((rest ?? (rest = src.slice(i))));
       if (m) {
         let text = m[2].replace(/\n/g, ' ');
         if (/[^ ]/.test(text) && text[0] === ' ' && text[text.length - 1] === ' ') {
@@ -659,7 +682,7 @@ function inlineParse(src, links, st, plain) {
     }
     // Hard break: two spaces or a backslash before a newline.
     if (!done && (ch === ' ' || ch === '\\')) {
-      const m = RE_BR.exec(rest);
+      const m = RE_BR.exec((rest ?? (rest = src.slice(i))));
       if (m) { if (!plain) out += '<br>'; i += m[0].length; done = true; }
     }
     // Strikethrough.
@@ -669,7 +692,7 @@ function inlineParse(src, links, st, plain) {
     }
     // Autolink: <scheme:...> or <email>.
     if (!done && ch === '<') {
-      const m = RE_AUTOLINK.exec(rest);
+      const m = RE_AUTOLINK.exec((rest ?? (rest = src.slice(i))));
       if (m) {
         const text = m[1];
         const href = m[2] === '@' ? 'mailto:' + text : text;
@@ -681,9 +704,12 @@ function inlineParse(src, links, st, plain) {
         i += m[0].length; done = true;
       }
     }
-    // GFM extended autolink: www., scheme://, bare email.
+    // GFM extended autolink: www., scheme://, bare email. Cheap pre-checks
+    // (no slice, no regex) so the full pattern only runs on plausible starts.
     if (!done && !st.inLink && (isAlnumAscii(ch) || ch === '.' || ch === '_' || ch === '+' || ch === '-')) {
-      const m = RE_URL.exec(rest);
+      const maybeUrl = emailProtoAt(src, i) || urlProtoAt(src, i) ||
+        src.startsWith('www.', i) || emailStartsAt(src, i);
+      const m = maybeUrl ? RE_URL.exec((rest ?? (rest = src.slice(i)))) : null;
       if (m) {
         let text, href;
         if (m[2] === '@') { text = m[0]; href = 'mailto:' + m[0]; }
