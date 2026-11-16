@@ -505,6 +505,9 @@ function textEnd(src, i) {
   const n = src.length;
   let j = i;
   const c0 = src[j];
+  // A non-alphanumeric character followed by mailto:/xmpp: is a token alone
+  // (marked's text rule's first alternative).
+  if (!isAlnumAscii(c0) && emailProtoAt(src, i + 1)) return i + 1;
   if (c0 === '`' || c0 === '~') {
     while (j < n && src[j] === c0) j++;
     if (j < n && (src[j] === '`' || src[j] === '~')) return j;
@@ -756,6 +759,9 @@ const P_FENCES_LOOK = ' {0,3}(?:`{3,}(?=[^`\\n]*(?:\\n|$))|~~~)[^\\n]*(?:\\n|$)'
 const P_HTML_LOOK = ' {0,3}(?:</?(?:tag)(?: +|\\n|/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)';
 const P_TABLE_DELIM = ' {0,3}\\|?(?:[:\\- ]*\\|)+[\\:\\- ]*\\n';
 const P_LIST_PARA = ' {0,3}(?:[*+-]|1[.)])[ \\t]+[^ \\t\\n]';
+// The list test used inside a blockquote's paragraph (marked's Ke): a bare
+// bullet at end-of-line also starts a list, so it blocks the continuation.
+const P_LIST_BQ = ' {0,3}(?:[*+-]|\\d{1,9}[.)])(?:[ \\t]|\\n|$)';
 
 const RE_NEWLINE = /^(?:[ \t]*(?:\n|$))+/;
 const RE_INDENTED_CODE = /^((?: {4}| {0,3}\t)[^\n]+(?:\n(?:[ \t]*(?:\n|$))*)?)+/;
@@ -808,10 +814,26 @@ const RE_PARAGRAPH = compose(/^([^\n]+(?:\n(?!hr|heading|lheading|blockquote|fen
   .replace('tag', TAG_LIST)
   .getRegex();
 
+// The paragraph variant used inside a blockquote (marked's Ke): the list
+// test also matches a bare bullet at end-of-line, and there is no table or
+// setext alternative, so a lazy line starting a list (even a bare "-") ends
+// the paragraph and the blockquote.
+const RE_PARAGRAPH_BQ = compose(/^([^\n]+(?:\n(?!hr|heading|lheading|blockquote|fences|list|html|table|[ \t]+\n)[^\n]+)*)/)
+  .replace('hr', P_HR_SRC)
+  .replace('heading', P_HEADING_LOOK)
+  .replace('|lheading', '')
+  .replace('|table', '')
+  .replace('blockquote', ' {0,3}>')
+  .replace('fences', P_FENCES_LOOK)
+  .replace('list', P_LIST_BQ)
+  .replace('html', P_HTML_LOOK)
+  .replace('tag', TAG_LIST)
+  .getRegex();
+
 // Block quote: a run of lines each starting with > (a paragraph may span
 // several lines, including lazy continuation lines without >).
 const RE_BLOCKQUOTE = compose(/^( {0,3}> ?(?:(?![ \t]*(?:\n|$))(paragraph)|[^\n]*)(?:\n|$))+/ )
-  .replace('paragraph', RE_PARAGRAPH)
+  .replace('paragraph', RE_PARAGRAPH_BQ)
   .getRegex();
 
 // Link reference definition.
@@ -868,10 +890,22 @@ const blockquoteBeginRegex = memoIndent((a) => new RegExp(`^ {0,${a}}>`));
 // ['item', task, checked, children, text, raw] ['cb', checked]
 // ['table', align, header, rows] ['def'] ['space', raw]
 
-// A block-parsing context: the link definitions and the "top" flag (paragraphs
-// are only tokenized at the top level, not inside list items).
+// A block-parsing context: the link definitions, the "top" flag (paragraphs
+// are only tokenized at the top level, not inside list items), and the queue
+// of inline-parse sites, in creation order. The queue mirrors marked's
+// Lexer.inlineQueue: each entry is a {node, idx} pair pointing at the text
+// field of a block node (or table cell) whose inline content is rendered
+// from that field. The list task handler strips the marker from the LAST
+// queue entry matching the task pattern, which may belong to a later item.
 function newCtx() {
-  return { links: Object.create(null), top: true };
+  return { links: Object.create(null), top: true, inlineQueue: [] };
+}
+
+// Record an inline-parse site: the text field node[idx] is this node's
+// inline source. The queue entry keeps a live reference to the node, so
+// merges that extend the text are visible through it.
+function queueInline(ctx, node, idx) {
+  ctx.inlineQueue.push({ node, idx });
 }
 
 // Fenced code: returns {node, rawLen} or null.
@@ -893,7 +927,7 @@ function tryFences(rest) {
 }
 
 // ATX heading.
-function tryHeading(rest) {
+function tryHeading(rest, ctx) {
   const m = RE_HEADING.exec(rest);
   if (!m) return null;
   let text = m[2].trim();
@@ -901,14 +935,18 @@ function tryHeading(rest) {
     const stripped = stripTrail(text, '#');
     if (!stripped || /[ \t]$/.test(stripped)) text = stripped.trim();
   }
-  return { node: ['h', m[1].length, text], rawLen: stripTrail(m[0], '\n').length };
+  const node = ['h', m[1].length, text];
+  queueInline(ctx, node, 2);
+  return { node, rawLen: stripTrail(m[0], '\n').length };
 }
 
 // Setext heading.
-function tryLheading(rest) {
+function tryLheading(rest, ctx) {
   const m = RE_LHEADING.exec(rest);
   if (!m) return null;
-  return { node: ['h', m[2].charAt(0) === '=' ? 1 : 2, m[1].trim()], rawLen: stripTrail(m[0], '\n').length };
+  const node = ['h', m[2].charAt(0) === '=' ? 1 : 2, m[1].trim()];
+  queueInline(ctx, node, 2);
+  return { node, rawLen: stripTrail(m[0], '\n').length };
 }
 
 // GFM table.
@@ -925,11 +963,11 @@ function tryTable(rest, ctx) {
     else if (/^ *:-+ *$/.test(d)) align.push('left');
     else align.push(null);
   }
-  const header = headerCells.map((c, i) => [c, align[i]]);
+  const header = headerCells.map((c, i) => { const cell = [c, align[i]]; queueInline(ctx, cell, 0); return cell; });
   const rows = [];
   if (m[3] && m[3].trim()) {
     for (const line of m[3].replace(/\n[ \t]*$/, '').split('\n')) {
-      rows.push(splitTableRow(line, header.length).map((c, i) => [c, align[i]]));
+      rows.push(splitTableRow(line, header.length).map((c, i) => { const cell = [c, align[i]]; queueInline(ctx, cell, 0); return cell; }));
     }
   }
   return { node: ['table', align, header, rows], rawLen: stripTrail(m[0], '\n').length };
@@ -1077,12 +1115,23 @@ function tryList(rest, ctx) {
   }
   ctx.top = true;
   // Task lists: strip the [ ]/[x] marker and insert a checkbox token.
+  // The marker is stripped from the item text and, per marked, from the LAST
+  // queued inline source matching the task pattern — which may belong to a
+  // later item (its inline tokens are parsed from the queued source, so the
+  // strip lands there even though the checkbox lands here). The first
+  // token's own text is left alone: it IS the queued source.
   for (const item of items) {
     const d0 = item[3][0];
     item[1] = !!RE_LIST_TASK.test(item[4]);
     if (item[1] && d0 && (d0[0] === 't' || d0[0] === 'p')) {
       item[4] = item[4].replace(RE_LIST_TASK_STRIP, '');
-      d0[1] = d0[1].replace(RE_LIST_TASK_STRIP, '');
+      for (let g = ctx.inlineQueue.length - 1; g >= 0; g--) {
+        const e = ctx.inlineQueue[g];
+        if (RE_LIST_TASK.test(e.node[e.idx])) {
+          e.node[e.idx] = e.node[e.idx].replace(RE_LIST_TASK_STRIP, '');
+          break;
+        }
+      }
       const k = RE_LIST_TASK_BOX.exec(item[5]);
       if (k) {
         const box = ['cb', k[0] !== '[ ]'];
@@ -1149,7 +1198,7 @@ function blockTokens(src, ctx, inBq, nodes) {
     }
     // ATX heading.
     {
-      const h = tryHeading(rest);
+      const h = tryHeading(rest, ctx);
       if (h) { out.push(h.node); rest = rest.slice(h.rawLen); continue; }
     }
     // Thematic break.
@@ -1198,14 +1247,14 @@ function blockTokens(src, ctx, inBq, nodes) {
     }
     // Setext heading.
     {
-      const lh = tryLheading(rest);
+      const lh = tryLheading(rest, ctx);
       if (lh) { out.push(lh.node); rest = rest.slice(lh.rawLen); continue; }
     }
     // Paragraph (top level only).
     if (ctx.top && (m = RE_PARAGRAPH.exec(rest))) {
       const text = m[1].charAt(m[1].length - 1) === '\n' ? m[1].slice(0, -1) : m[1];
       if (n && prev && prev[0] === 'p') prev[1] += '\n' + text;
-      else out.push(['p', text]);
+      else { const node = ['p', text]; queueInline(ctx, node, 1); out.push(node); }
       n = false;
       rest = rest.slice(m[0].length);
       continue;
@@ -1213,7 +1262,7 @@ function blockTokens(src, ctx, inBq, nodes) {
     // Plain text line (inside list items, where paragraphs are off).
     if ((m = /^[^\n]+/.exec(rest))) {
       if (prev && prev[0] === 't') prev[1] += '\n' + m[0];
-      else out.push(['t', m[0]]);
+      else { const node = ['t', m[0]]; queueInline(ctx, node, 1); out.push(node); }
       rest = rest.slice(m[0].length);
       continue;
     }
