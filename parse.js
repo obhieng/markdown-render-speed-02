@@ -1128,17 +1128,20 @@ function tryList(rest, ctx) {
       const vRe = nextBulletRegex(R), qRe = hrRegexAt(R), eeRe = fencesBeginRegex(R),
         teRe = headingBeginRegex(R), mRe = htmlBeginRegex(R), neRe = blockquoteBeginRegex(R);
       while (e) {
-        const U = e.split('\n', 1)[0];
+        const nl = e.indexOf('\n');
+        const U = nl === -1 ? e : e.slice(0, nl);
         f = U;
-        const Z = f.replace(RE_LEADING_SPACE, (me) => expandTabs(me, 0));
+        const c0 = f.charCodeAt(0);
+        const Z = (c0 === 32 || c0 === 9) ? f.replace(RE_LEADING_SPACE, (me) => me.includes('\t') ? expandTabs(me, 0) : me) : f;
         if (listBeginHit(f, R, eeRe, teRe, mRe, neRe, vRe, qRe)) break;
-        if (Z.search(RE_NON_SPACE) >= R || !f.trim()) d += '\n' + Z.slice(R);
+        const firstNS = Z.search(RE_NON_SPACE);
+        if (firstNS >= R || firstNS === -1) d += '\n' + Z.slice(R);
         else {
-          if (y || m.replace(/\t/g, '    ').search(RE_NON_SPACE) >= 4 || listBeginHit(m, R, eeRe, teRe, mRe, null, null, qRe)) break;
+          if (y || (m.includes('\t') ? m.replace(/\t/g, '    ') : m).search(RE_NON_SPACE) >= 4 || listBeginHit(m, R, eeRe, teRe, mRe, null, null, qRe)) break;
           const qe = RE_SETEXT_LINE.test(f) && RE_LHEADING.test(m + '\n' + f) ? '    ' + Z.replace(/^ {0,3}/, '') : f;
           d += '\n' + qe;
         }
-        y = !f.trim();
+        y = firstNS === -1;
         e = e.substring(U.length + 1);
         m = Z.slice(R);
       }
