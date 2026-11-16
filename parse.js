@@ -565,7 +565,10 @@ function inlineParse(src, links, st, plain) {
   const linkParenPossible = src.includes(')');
   let masked = null, closer = null;
   if (src.includes('*') || src.includes('_') || src.includes('~')) {
-    masked = maskForEmphasis(src, links);
+    // The mask only hides delimiters inside code spans, links, and HTML;
+    // with no ` [ < \ present it is the identity, so skip the three replaces.
+    masked = (src.includes('`') || src.includes('[') || src.includes('<') || src.includes('\\'))
+      ? maskForEmphasis(src, links) : src;
     closer = closerInfo(masked);
   }
   let out = '';
@@ -1065,6 +1068,22 @@ function tryBlockquote(rest, ctx) {
 }
 
 // List. Returns {node, rawLen} or null.
+// List continuation "begin" tests, dispatched on the first non-space char:
+// a line can only begin a fence/heading/html/blockquote/bullet/hr when its
+// first marker char (within the allowed indent) is one of those markers.
+// Plain prose lines skip all six regexes.
+function listBeginHit(f, R, eeRe, teRe, mRe, neRe, vRe, qRe) {
+  let p = 0;
+  while (p < R && f.charCodeAt(p) === 32) p++;
+  const fc = f[p];
+  if (fc === '`' || fc === '~') return eeRe.test(f);
+  if (fc === '#') return teRe.test(f);
+  if (fc === '<') return mRe.test(f);
+  if (fc === '>') return neRe ? neRe.test(f) : false;
+  if (fc === '*' || fc === '+' || fc === '-' || (fc >= '0' && fc <= '9')) return vRe ? (vRe.test(f) || qRe.test(f)) : qRe.test(f);
+  return false;
+}
+
 function tryList(rest, ctx) {
   const t = RE_LIST_START.exec(rest);
   if (!t) return null;
@@ -1106,10 +1125,10 @@ function tryList(rest, ctx) {
         const U = e.split('\n', 1)[0];
         f = U;
         const Z = f.replace(RE_LEADING_SPACE, (me) => expandTabs(me, 0));
-        if (eeRe.test(f) || teRe.test(f) || mRe.test(f) || neRe.test(f) || vRe.test(f) || qRe.test(f)) break;
+        if (listBeginHit(f, R, eeRe, teRe, mRe, neRe, vRe, qRe)) break;
         if (Z.search(RE_NON_SPACE) >= R || !f.trim()) d += '\n' + Z.slice(R);
         else {
-          if (y || m.replace(/\t/g, '    ').search(RE_NON_SPACE) >= 4 || eeRe.test(m) || teRe.test(m) || mRe.test(m) || qRe.test(m)) break;
+          if (y || m.replace(/\t/g, '    ').search(RE_NON_SPACE) >= 4 || listBeginHit(m, R, eeRe, teRe, mRe, null, null, qRe)) break;
           const qe = RE_SETEXT_LINE.test(f) && RE_LHEADING.test(m + '\n' + f) ? '    ' + Z.replace(/^ {0,3}/, '') : f;
           d += '\n' + qe;
         }
@@ -1384,7 +1403,7 @@ function renderBlocks(nodes, links, st) {
 // ============================== entry point ==============================
 
 export function parse(markdown) {
-  const src = markdown.replace(/\r\n|\r/g, '\n');
+  const src = markdown.includes('\r') ? markdown.replace(/\r\n|\r/g, '\n') : markdown;
   const ctx = newCtx();
   const nodes = blockTokens(src, ctx, false, []);
   const st = { inLink: false, inRawBlock: false, linkEmitted: false };
