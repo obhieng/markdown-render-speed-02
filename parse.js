@@ -142,6 +142,10 @@ function isAlnumAscii(ch) {
 // local part followed by '@', and a hard-break run of spaces + newline.
 const RE_EMAIL_AT = /[a-zA-Z0-9.!#$%&'*+\/=?_`{|}~-]+@/y;
 const RE_HARD_BREAK = / {2,}\n/y;
+// Next text-run stop, searched with one native regex exec: a special char,
+// a protocol, www., mailto:/xmpp:, an email start, or a hard-break run.
+// Groups: 1 special, 2 protocol, 3 www., 4 mailto/xmpp, 5 email, 6 hard break.
+const RE_TEXT_STOP = /([\\<!\[`*~_])|([hH][tT][tT][pP][sS]?:\/\/|[fF][tT][pP]:\/\/)|(www\.)|(mailto:|xmpp:)|([a-zA-Z0-9.!#$%&'*+\/=?_`{|}~-]+@)|( {2,}\n)/g;
 
 // Does src starting at j begin with an email local part followed by '@'?
 // (Sticky regex, no allocation.)
@@ -532,22 +536,24 @@ function textEnd(src, i) {
   if (src[j] === '`' || src[j] === '~') return j;
   if (src[j] === ' ') { RE_HARD_BREAK.lastIndex = j; if (RE_HARD_BREAK.test(src)) return j; }
   if (emailStartsAt(src, j)) return j;
-  while (j < n) {
-    const c = src[j];
-    if (c === '\\' || c === '<' || c === '!' || c === '[' || c === '`' || c === '*' || c === '~' || c === '_') return j;
-    if ((c === 'h' || c === 'H' || c === 'f' || c === 'F') && urlProtoAt(src, j)) return j;
-    if (c === 'w' && wwwStartsAt(src, j, src[j - 1] ?? '')) return j;
-    // A non-space character followed by two or more spaces and a newline is
-    // kept in the text; the run ends right after it (hard break follows).
-    if (c !== ' ' && src[j + 1] === ' ') {
-      RE_HARD_BREAK.lastIndex = j + 1;
-      if (RE_HARD_BREAK.test(src)) return j + 1;
+  // Scan for the next stop with one native regex exec per stop candidate.
+  // www. and mailto:/xmpp: need a valid preceding char; an invalid one is
+  // skipped and the search resumes after it.
+  RE_TEXT_STOP.lastIndex = j;
+  let m;
+  while ((m = RE_TEXT_STOP.exec(src)) !== null) {
+    const idx = m.index;
+    if (m[3] !== undefined) { // www.
+      if (wwwStartsAt(src, idx, src[idx - 1] ?? '')) return idx;
+      RE_TEXT_STOP.lastIndex = idx + 4;
+      continue;
     }
-    // A non-alphanumeric character followed by mailto:/xmpp: is kept, then stop.
-    if (!isAlnumAscii(c) && emailProtoAt(src, j + 1)) return j + 1;
-    // A character outside the email local set, followed by local@, is kept.
-    if (!isEmailLocal(c) && emailStartsAt(src, j + 1)) return j + 1;
-    j++;
+    if (m[4] !== undefined) { // mailto:/xmpp: — preceding char must be non-alnum
+      if (!isAlnumAscii(src[idx - 1])) return idx;
+      RE_TEXT_STOP.lastIndex = idx + m[4].length;
+      continue;
+    }
+    return idx;
   }
   return n;
 }
